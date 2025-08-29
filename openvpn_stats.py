@@ -13,7 +13,14 @@ CONFIG = {
     'output_html': '/var/www/html/RTi/sitemate.ru/www/vpnstat/index.html',
     'data_dir': '/var/log/openvpn_stats',
     'months_to_keep': 1,
-    'total_bandwidth': 150
+    'total_bandwidth': 150,
+    'aggregation_interval': '1h'  # допустимые значения: '10m', '30m', '1h'
+}
+
+INTERVAL_SECONDS = {
+    '10m': 600,
+    '30m': 1800,
+    '1h': 3600
 }
 
 def get_local_time():
@@ -67,7 +74,7 @@ def parse_status(raw_data):
                     'connected_since': parts[7],
                     'timestamp': get_local_time().isoformat()
                 }
-            except (IndexError, ValueError) as e:
+            except (IndexError, ValueError):
                 print(f"Ошибка парсинга строки: {line}")
     return clients
 
@@ -100,56 +107,103 @@ def load_all_history():
     
     return history
 
+def round_time_to_interval(dt, interval_seconds):
+    seconds_since_day_start = (dt - dt.replace(hour=0, minute=0, second=0, microsecond=0)).seconds
+    rounded_seconds = (seconds_since_day_start // interval_seconds) * interval_seconds
+    rounded_time = dt.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(seconds=rounded_seconds)
+    return rounded_time
+
 def calculate_stats(history):
     all_users = set()
-    user_stats = defaultdict(lambda: {'downloaded': 0, 'uploaded': 0, 'sessions': 0})
-    hourly_stats = []
-    
+    user_stats_24h = defaultdict(lambda: {'downloaded': 0, 'uploaded': 0})
+    user_stats_week = defaultdict(lambda: {'downloaded': 0, 'uploaded': 0})
+    user_stats_month = defaultdict(lambda: {'downloaded': 0, 'uploaded': 0})
+    aggregate = defaultdict(lambda: {'downloaded': [], 'uploaded': []})
+
+    interval_key = CONFIG.get('aggregation_interval', '1h')
+    interval_seconds = INTERVAL_SECONDS.get(interval_key, 3600)
+
+    cutoff_24h = get_local_time() - timedelta(hours=24)
+    cutoff_week = get_local_time() - timedelta(days=7)
+    cutoff_month = get_local_time() - timedelta(days=30)
+
     for filename, day_data in history.items():
         try:
-            dt = datetime.strptime(filename, '%Y-%m-%d_%H-%M').replace(tzinfo=timezone(timedelta(hours=3)))
+            file_dt = datetime.strptime(filename, '%Y-%m-%d_%H-%M').replace(tzinfo=timezone(timedelta(hours=3)))
+            bucket_time = round_time_to_interval(file_dt, interval_seconds)
+            bucket_key = bucket_time.strftime('%Y-%m-%d %H:%M')
         except ValueError:
             continue
-        
+
         total_downloaded = 0
         total_uploaded = 0
-        
+
         for user, data in day_data.items():
             all_users.add(user)
-            downloaded = data.get('bytes_received', 0)  # Исправлено: bytes_received - это скачанные данные клиентом
-            uploaded = data.get('bytes_sent', 0)         # bytes_sent - это загруженные данные клиентом
+            downloaded = data.get('bytes_received', 0)
+            uploaded = data.get('bytes_sent', 0)
+
             total_downloaded += downloaded
             total_uploaded += uploaded
-            user_stats[user]['downloaded'] += downloaded
-            user_stats[user]['uploaded'] += uploaded
-            user_stats[user]['sessions'] += 1
-        
-        # Рассчитываем мегабиты в секунду (5-минутный интервал)
-        interval_seconds = 300  # 5 минут
-        downloaded_mbps = (total_downloaded * 8) / (interval_seconds * 1000 * 1000)
-        uploaded_mbps = (total_uploaded * 8) / (interval_seconds * 1000 * 1000)
-        
-        hourly_stats.append({
-            'time': dt.strftime('%Y-%m-%d %H:%M'),
-            'downloaded': round(downloaded_mbps, 2),
-            'uploaded': round(uploaded_mbps, 2),
-            'total': round(downloaded_mbps + uploaded_mbps, 2)
+
+            # Статистика за разные периоды
+            if file_dt >= cutoff_24h:
+                user_stats_24h[user]['downloaded'] += downloaded
+                user_stats_24h[user]['uploaded'] += uploaded
+            
+            if file_dt >= cutoff_week:
+                user_stats_week[user]['downloaded'] += downloaded
+                user_stats_week[user]['uploaded'] += uploaded
+            
+            if file_dt >= cutoff_month:
+                user_stats_month[user]['downloaded'] += downloaded
+                user_stats_month[user]['uploaded'] += uploaded
+
+        raw_interval_seconds = 300
+        downloaded_mbps = (total_downloaded * 8) / (raw_interval_seconds * 1000 * 1000)
+        uploaded_mbps = (total_uploaded * 8) / (raw_interval_seconds * 1000 * 1000)
+
+        aggregate[bucket_key]['downloaded'].append(downloaded_mbps)
+        aggregate[bucket_key]['uploaded'].append(uploaded_mbps)
+
+    interval_stats = []
+    for bucket, values in sorted(aggregate.items()):
+        if values['downloaded']:
+            avg_downloaded = sum(values['downloaded']) / len(values['downloaded'])
+            avg_uploaded = sum(values['uploaded']) / len(values['uploaded'])
+        else:
+            avg_downloaded = avg_uploaded = 0
+
+        interval_stats.append({
+            'time': bucket,
+            'downloaded': round(avg_downloaded, 2),
+            'uploaded': round(avg_uploaded, 2),
+            'total': round(avg_downloaded + avg_uploaded, 2)
         })
-    
-    sorted_users = sorted(
-        all_users,
-        key=lambda u: user_stats[u]['downloaded'] + user_stats[u]['uploaded'],
-        reverse=True
-    )
-    
-    hourly_stats.sort(key=lambda x: x['time'])
-    
+
+    # Рассчитываем итоги для каждого периода
+    def calculate_totals(stats_dict):
+        total_downloaded = sum(stats['downloaded'] for stats in stats_dict.values())
+        total_uploaded = sum(stats['uploaded'] for stats in stats_dict.values())
+        return {
+            'downloaded': total_downloaded,
+            'uploaded': total_uploaded,
+            'total': total_downloaded + total_uploaded
+        }
+
     return {
-        'all_users': sorted_users,
-        'user_stats': user_stats,
-        'hourly_stats': hourly_stats,
+        'all_users': list(all_users),
+        'user_stats_24h': user_stats_24h,
+        'user_stats_week': user_stats_week,
+        'user_stats_month': user_stats_month,
+        'hourly_stats': interval_stats,
         'max_bandwidth': CONFIG['total_bandwidth'],
-        'report_date': get_local_time().strftime('%Y-%m-%d %H:%M')
+        'report_date': get_local_time().strftime('%Y-%m-%d %H:%M'),
+        'totals': {
+            '24h': calculate_totals(user_stats_24h),
+            'week': calculate_totals(user_stats_week),
+            'month': calculate_totals(user_stats_month)
+        }
     }
 
 def format_bytes(size):
@@ -160,11 +214,6 @@ def format_bytes(size):
     return f"{size:.2f} ТБ"
 
 def generate_html_report(stats):
-    time_labels = [h['time'][11:16] for h in stats['hourly_stats']] if stats['hourly_stats'] else ["Нет данных"]
-    downloaded_data = [h['downloaded'] for h in stats['hourly_stats']] if stats['hourly_stats'] else [0]
-    uploaded_data = [h['uploaded'] for h in stats['hourly_stats']] if stats['hourly_stats'] else [0]
-    total_data = [h['total'] for h in stats['hourly_stats']] if stats['hourly_stats'] else [0]
-    
     html = f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -185,12 +234,54 @@ def generate_html_report(stats):
             position: relative;
             height: 400px;
         }}
+        .btn-toggle {{
+            margin-bottom: 15px;
+        }}
+        .btn-toggle .btn.active {{
+            background-color: #0d6efd;
+            color: white;
+        }}
+        .table-totals {{
+            font-weight: bold;
+            background-color: #2c2c2c;
+        }}
+        .sortable {{
+            cursor: pointer;
+            position: relative;
+        }}
+        .sortable::after {{
+            content: '';
+            display: inline-block;
+            margin-left: 5px;
+            width: 0;
+            height: 0;
+            border-left: 5px solid transparent;
+            border-right: 5px solid transparent;
+            border-top: 5px solid #ccc;
+            opacity: 0.5;
+        }}
+        .sortable.asc::after {{
+            border-top: none;
+            border-bottom: 5px solid #fff;
+            opacity: 1;
+        }}
+        .sortable.desc::after {{
+            border-top: 5px solid #fff;
+            border-bottom: none;
+            opacity: 1;
+        }}
     </style>
 </head>
 <body>
 <div class="container">
     <h1 class="mb-4">OpenVPN статистика</h1>
     <p>Обновлено: {stats['report_date']} (UTC+3)</p>
+
+    <div class="btn-group btn-toggle" role="group">
+        <button id="btn24h" type="button" class="btn btn-primary active" onclick="switchView('24h')">Последние 24 часа</button>
+        <button id="btnWeek" type="button" class="btn btn-secondary" onclick="switchView('week')">Последняя неделя</button>
+        <button id="btnMonth" type="button" class="btn btn-secondary" onclick="switchView('month')">Последний месяц</button>
+    </div>
 
     <div class="card bg-dark mb-4">
         <div class="card-body">
@@ -207,30 +298,22 @@ def generate_html_report(stats):
                 <table class="table table-dark table-bordered">
                     <thead>
                         <tr>
-                            <th>Пользователь</th>
-                            <th>Скачано</th>
-                            <th>Загружено</th>
-                            <th class="total-traffic">Всего</th>
-                            <th>Сессий</th>
+                            <th class="sortable" onclick="sortTable('user')">Пользователь</th>
+                            <th class="sortable" onclick="sortTable('tx')">Tx</th>
+                            <th class="sortable" onclick="sortTable('rx')">Rx</th>
+                            <th class="sortable total-traffic" onclick="sortTable('total')">Всего</th>
                         </tr>
                     </thead>
-                    <tbody>"""
-    
-    for user in stats['all_users']:
-        downloaded = stats['user_stats'][user]['downloaded']
-        uploaded = stats['user_stats'][user]['uploaded']
-        total = downloaded + uploaded
-        html += f"""
-                        <tr>
-                            <td>{user}</td>
-                            <td>{format_bytes(downloaded)}</td>
-                            <td>{format_bytes(uploaded)}</td>
-                            <td class="total-traffic">{format_bytes(total)}</td>
-                            <td>{stats['user_stats'][user]['sessions']}</td>
-                        </tr>"""
-    
-    html += f"""
+                    <tbody id="userTableBody">
                     </tbody>
+                    <tfoot>
+                        <tr class="table-totals">
+                            <td>Всего</td>
+                            <td id="totalTx"></td>
+                            <td id="totalRx"></td>
+                            <td id="totalAll" class="total-traffic"></td>
+                        </tr>
+                    </tfoot>
                 </table>
             </div>
         </div>
@@ -238,58 +321,235 @@ def generate_html_report(stats):
 </div>
 
 <script>
-const ctx = document.getElementById('trafficChart').getContext('2d');
-new Chart(ctx, {{
-    type: 'line',
-    data: {{
-        labels: {json.dumps(time_labels)},
-        datasets: [
-            {{
-                label: 'Скачано (Мбит/с)',
-                data: {json.dumps(downloaded_data)},
-                borderColor: 'rgb(54, 162, 235)',
-                backgroundColor: 'rgba(54, 162, 235, 0.2)',
-                fill: true
-            }},
-            {{
-                label: 'Загружено (Мбит/с)',
-                data: {json.dumps(uploaded_data)},
-                borderColor: 'rgb(75, 192, 192)',
-                backgroundColor: 'rgba(75, 192, 192, 0.2)',
-                fill: true
-            }},
-            {{
-                label: 'Всего (Мбит/с)',
-                data: {json.dumps(total_data)},
-                borderColor: 'rgb(255, 99, 132)',
-                backgroundColor: 'rgba(255, 99, 132, 0.2)',
-                fill: false,
-                borderWidth: 2
-            }}
-        ]
-    }},
-    options: {{
-        responsive: true,
-        scales: {{
-            y: {{
-                beginAtZero: true,
-                title: {{
-                    display: true,
-                    text: 'Мбит/с'
+const rawData = {json.dumps(stats['hourly_stats'])};
+const userStats = {{
+    '24h': {json.dumps(stats['user_stats_24h'])},
+    'week': {json.dumps(stats['user_stats_week'])},
+    'month': {json.dumps(stats['user_stats_month'])}
+}};
+const totals = {json.dumps(stats['totals'])};
+
+let currentView = '24h';
+let sortField = 'total';
+let sortDirection = 'desc';
+
+function filterData(days) {{
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - days);
+    return rawData.filter(item => new Date(item.time) >= cutoff);
+}}
+
+function aggregateData(data, intervalHours) {{
+    const buckets = {{}};
+    data.forEach(item => {{
+        const dt = new Date(item.time);
+        const bucketKey = new Date(Math.floor(dt.getTime() / (intervalHours*3600*1000)) * intervalHours*3600*1000);
+        const key = bucketKey.toISOString();
+        if (!buckets[key]) {{
+            buckets[key] = {{downloaded: [], uploaded: [], total: []}};
+        }}
+        buckets[key].downloaded.push(item.downloaded);
+        buckets[key].uploaded.push(item.uploaded);
+        buckets[key].total.push(item.total);
+    }});
+    return Object.entries(buckets).map(([time, values]) => {{
+        return {{
+            time: time,
+            downloaded: values.downloaded.reduce((a,b)=>a+b,0)/values.downloaded.length,
+            uploaded: values.uploaded.reduce((a,b)=>a+b,0)/values.uploaded.length,
+            total: values.total.reduce((a,b)=>a+b,0)/values.total.length
+        }}
+    }}).sort((a,b)=> new Date(a.time)-new Date(b.time));
+}}
+
+function formatLabel(timeString, viewMode) {{
+    const dt = new Date(timeString);
+    if (viewMode === '24h') {{
+        return dt.toLocaleTimeString('ru-RU', {{hour: '2-digit', minute: '2-digit'}});
+    }} else {{
+        return dt.toLocaleDateString('ru-RU', {{day: '2-digit', month: '2-digit'}});
+    }}
+}}
+
+function renderChart(data, viewMode) {{
+    const ctx = document.getElementById('trafficChart').getContext('2d');
+    if (window.chartInstance) {{
+        window.chartInstance.destroy();
+    }}
+    window.chartInstance = new Chart(ctx, {{
+        type: 'line',
+        data: {{
+            labels: data.map(h => formatLabel(h.time, viewMode)),
+            datasets: [
+                {{
+                    label: 'Tx (Мбит/с)',
+                    data: data.map(h => h.downloaded),
+                    borderColor: 'rgb(54, 162, 235)',
+                    backgroundColor: 'rgba(54, 162, 235, 0.2)',
+                    fill: true
                 }},
-                suggestedMax: {CONFIG['total_bandwidth']}
-            }}
+                {{
+                    label: 'Rx (Мбит/с)',
+                    data: data.map(h => h.uploaded),
+                    borderColor: 'rgb(75, 192, 192)',
+                    backgroundColor: 'rgba(75, 192, 192, 0.2)',
+                    fill: true
+                }},
+                {{
+                    label: 'Всего (Мбит/с)',
+                    data: data.map(h => h.total),
+                    borderColor: 'rgb(255, 99, 132)',
+                    backgroundColor: 'rgba(255, 99, 132, 0.2)',
+                    fill: false,
+                    borderWidth: 2
+                }}
+            ]
         }},
-        plugins: {{
-            tooltip: {{
-                callbacks: {{
-                    label: function(context) {{
-                        return context.dataset.label + ': ' + context.raw.toFixed(2) + ' Мбит/с';
+        options: {{
+            responsive: true,
+            scales: {{
+                y: {{
+                    beginAtZero: true,
+                    title: {{
+                        display: true,
+                        text: 'Мбит/с'
+                    }},
+                    suggestedMax: {CONFIG['total_bandwidth']}
+                }}
+            }},
+            plugins: {{
+                tooltip: {{
+                    callbacks: {{
+                        label: function(context) {{
+                            return context.dataset.label + ': ' + context.raw.toFixed(2) + ' Мбит/с';
+                        }}
                     }}
                 }}
             }}
         }}
+    }});
+}}
+
+function formatBytes(size) {{
+    const units = ['Б', 'КБ', 'МБ', 'ГБ'];
+    let i = 0;
+    while (size >= 1024 && i < units.length - 1) {{
+        size /= 1024;
+        i++;
     }}
+    return size.toFixed(2) + ' ' + units[i];
+}}
+
+function updateUserTable() {{
+    const tbody = document.getElementById('userTableBody');
+    tbody.innerHTML = '';
+    
+    const currentStats = userStats[currentView];
+    const users = Object.keys(currentStats);
+    
+    // Сортировка
+    users.sort((a, b) => {{
+        let valueA, valueB;
+        
+        switch(sortField) {{
+            case 'user':
+                valueA = a.toLowerCase();
+                valueB = b.toLowerCase();
+                break;
+            case 'tx':
+                valueA = currentStats[a].downloaded;
+                valueB = currentStats[b].downloaded;
+                break;
+            case 'rx':
+                valueA = currentStats[a].uploaded;
+                valueB = currentStats[b].uploaded;
+                break;
+            case 'total':
+                valueA = currentStats[a].downloaded + currentStats[a].uploaded;
+                valueB = currentStats[b].downloaded + currentStats[b].uploaded;
+                break;
+        }}
+        
+        if (sortDirection === 'asc') {{
+            return valueA > valueB ? 1 : -1;
+        }} else {{
+            return valueA < valueB ? 1 : -1;
+        }}
+    }});
+    
+    // Заполнение таблицы
+    users.forEach(user => {{
+        const downloaded = currentStats[user].downloaded;
+        const uploaded = currentStats[user].uploaded;
+        const total = downloaded + uploaded;
+        
+        const row = document.createElement('tr');
+        row.innerHTML = `
+            <td>${{user}}</td>
+            <td>${{formatBytes(downloaded)}}</td>
+            <td>${{formatBytes(uploaded)}}</td>
+            <td class="total-traffic">${{formatBytes(total)}}</td>
+        `;
+        tbody.appendChild(row);
+    }});
+    
+    // Обновление итогов
+    document.getElementById('totalTx').textContent = formatBytes(totals[currentView].downloaded);
+    document.getElementById('totalRx').textContent = formatBytes(totals[currentView].uploaded);
+    document.getElementById('totalAll').textContent = formatBytes(totals[currentView].total);
+}}
+
+function sortTable(field) {{
+    if (sortField === field) {{
+        sortDirection = sortDirection === 'asc' ? 'desc' : 'asc';
+    }} else {{
+        sortField = field;
+        sortDirection = 'desc';
+    }}
+    
+    // Обновление стрелочек сортировки
+    document.querySelectorAll('.sortable').forEach(el => {{
+        el.classList.remove('asc', 'desc');
+    }});
+    const header = document.querySelector(`.sortable[onclick="sortTable('${{sortField}}')"]`);
+    if (header) {{
+        header.classList.add(sortDirection);
+    }}
+    
+    updateUserTable();
+}}
+
+function switchView(view) {{
+    currentView = view;
+    
+    // Обновление активной кнопки
+    document.getElementById('btn24h').classList.remove('active');
+    document.getElementById('btnWeek').classList.remove('active');
+    document.getElementById('btnMonth').classList.remove('active');
+    document.getElementById('btn' + view.charAt(0).toUpperCase() + view.slice(1)).classList.add('active');
+    
+    // Обновление графика
+    let chartData;
+    if (view === '24h') {{
+        chartData = filterData(1);
+    }} else if (view === 'week') {{
+        const weekData = filterData(7);
+        chartData = aggregateData(weekData, 6);
+    }} else {{
+        const monthData = filterData(30);
+        chartData = aggregateData(monthData, 24);
+    }}
+    renderChart(chartData, view);
+    
+    // Обновление таблицы
+    updateUserTable();
+}}
+
+// Инициализация
+document.addEventListener('DOMContentLoaded', function() {{
+    // Устанавливаем начальную сортировку
+    sortTable('total');
+    switchView('24h');
 }});
 </script>
 
